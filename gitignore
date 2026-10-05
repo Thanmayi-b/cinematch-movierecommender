@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+.DS_Store
+Icon[\r]
+data/
+venv/
+.venv/
+*.pkl

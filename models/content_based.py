@@ -4,11 +4,12 @@ Uses TF-IDF on genres + tags + title features, plus optional
 sentence-transformer embeddings for semantic similarity.
 """
 
-import pandas as pd
+from difflib import get_close_matches
+
 import numpy as np
+import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import MinMaxScaler
 
 
 class ContentBasedRecommender:
@@ -16,28 +17,22 @@ class ContentBasedRecommender:
     Content-based movie recommender using TF-IDF on movie metadata.
 
     Features used:
-        - Genres (weighted heavily)
+        - Genres (weighted 3x by repetition)
         - User-provided tags (aggregated per movie)
-        - Title keywords
+        - Title keywords (year removed so "same release year" isn't a feature)
     """
 
     def __init__(self, use_embeddings: bool = False):
-        """
-        Args:
-            use_embeddings: If True, also use sentence-transformer embeddings.
-                            Requires `pip install sentence-transformers`.
-                            Falls back to TF-IDF only if not available.
-        """
         self.use_embeddings = use_embeddings
         self.vectorizer = TfidfVectorizer(
             analyzer="word",
             ngram_range=(1, 2),
             min_df=2,
             max_features=10_000,
-            stop_words="english"
+            stop_words="english",
         )
         self.tfidf_matrix = None
-        self.movie_indices = None  # title -> index
+        self.movie_indices = None  # title -> row index
         self.movies_df = None
         self.embeddings = None
 
@@ -45,28 +40,37 @@ class ContentBasedRecommender:
 
     def fit(self, movies: pd.DataFrame, tags: pd.DataFrame = None):
         """
-        Build the content feature matrix.
-
         Args:
             movies: DataFrame with columns [movieId, title, genres]
             tags: Optional DataFrame with columns [movieId, tag]
         """
         df = movies.copy().reset_index(drop=True)
+        df["genres"] = df["genres"].fillna("")
 
-        # Aggregate tags per movie
-        tag_text = pd.Series("", index=df["movieId"])
+        # Aggregate tags per movie (simple map; no string-add tricks)
         if tags is not None and len(tags) > 0:
-            agg = tags.groupby("movieId")["tag"].apply(lambda x: " ".join(x.dropna().astype(str)))
-            tag_text = tag_text.add(agg, fill_value="")
+            agg = tags.groupby("movieId")["tag"].apply(
+                lambda x: " ".join(x.dropna().astype(str))
+            )
+            df["tag_text"] = df["movieId"].map(agg).fillna("")
+        else:
+            df["tag_text"] = ""
 
-        df["tag_text"] = df["movieId"].map(tag_text).fillna("")
-
-        # Build soup: genres * 3 (upweight) + tags + title
-        df["genres_clean"] = df["genres"].str.replace(", ", " ").str.replace("-", "").str.lower()
+        # genres * 3 (upweight) + tags + title keywords
+        df["genres_clean"] = (
+            df["genres"]
+            .str.replace(", ", " ", regex=False)
+            .str.replace("|", " ", regex=False)
+            .str.replace("-", "", regex=False)
+            .str.lower()
+        )
         df["title_keywords"] = (
-            df["title"].str.lower()
+            df["title"]
+            .str.replace(r"\(\d{4}\)\s*$", "", regex=True)  # drop the year
+            .str.lower()
             .str.replace(r"[^a-z0-9 ]", " ", regex=True)
             .str.replace(r"\s+", " ", regex=True)
+            .str.strip()
         )
         df["soup"] = (
             df["genres_clean"] + " " + df["genres_clean"] + " " + df["genres_clean"] + " "
@@ -89,12 +93,28 @@ class ContentBasedRecommender:
         try:
             from sentence_transformers import SentenceTransformer
             model = SentenceTransformer("all-MiniLM-L6-v2")
-            texts = (df["title_clean"] if "title_clean" in df.columns else df["title"]) + " " + df["genres_clean"]
+            texts = df["title_keywords"] + " " + df["genres_clean"]
             self.embeddings = model.encode(texts.tolist(), show_progress_bar=True, batch_size=256)
             print("Sentence embeddings computed.")
         except ImportError:
             print("sentence-transformers not installed. Using TF-IDF only.")
             self.embeddings = None
+
+    # ── Helpers ─────────────────────────────────────────────────────────────
+
+    def _resolve_index(self, movie_title: str) -> int:
+        """Title -> row index (handles fuzzy match and duplicate titles)."""
+        if movie_title not in self.movie_indices.index:
+            matches = get_close_matches(
+                movie_title, self.movie_indices.index.tolist(), n=1, cutoff=0.5
+            )
+            if not matches:
+                raise ValueError(f"Movie '{movie_title}' not found in dataset.")
+            movie_title = matches[0]
+        idx = self.movie_indices[movie_title]
+        if isinstance(idx, pd.Series):
+            idx = idx.iloc[0]
+        return int(idx)
 
     # ── Recommendation ──────────────────────────────────────────────────────
 
@@ -102,57 +122,32 @@ class ContentBasedRecommender:
         """
         Return top-n movies most similar to movie_title.
 
-        Args:
-            movie_title: Exact title as in the dataset.
-            n: Number of recommendations.
-
         Returns:
             DataFrame with [movieId, title, genres, score]
         """
-        if movie_title not in self.movie_indices:
-            # Fuzzy fallback: find closest match
-            from difflib import get_close_matches
-            matches = get_close_matches(movie_title, self.movie_indices.index.tolist(), n=1, cutoff=0.5)
-            if not matches:
-                raise ValueError(f"Movie '{movie_title}' not found in dataset.")
-            movie_title = matches[0]
+        idx = self._resolve_index(movie_title)
 
-        idx = self.movie_indices[movie_title]
-        if isinstance(idx, pd.Series):
-            idx = idx.iloc[0]  # handle duplicate titles
+        scores = cosine_similarity(self.tfidf_matrix[idx], self.tfidf_matrix).flatten()
 
-        # TF-IDF similarity
-        query_vec = self.tfidf_matrix[idx]
-        tfidf_scores = cosine_similarity(query_vec, self.tfidf_matrix).flatten()
-
-        # Optionally blend with embedding similarity
         if self.embeddings is not None:
             emb_scores = cosine_similarity(
                 self.embeddings[idx].reshape(1, -1), self.embeddings
             ).flatten()
-            scores = 0.5 * tfidf_scores + 0.5 * emb_scores
-        else:
-            scores = tfidf_scores
+            scores = 0.5 * scores + 0.5 * emb_scores
 
-        # Exclude the query movie itself
-        scores[idx] = -1
+        scores[idx] = -1  # exclude the query movie itself
 
         top_indices = np.argsort(scores)[::-1][:n]
         result = self.movies_df.iloc[top_indices][["movieId", "title", "genres"]].copy()
         result["score"] = scores[top_indices]
         return result.reset_index(drop=True)
 
-    def get_movie_vector(self, movie_title: str) -> np.ndarray:
+    def get_movie_vector(self, movie_title: str):
         """Return the TF-IDF feature vector for a movie."""
-        idx = self.movie_indices[movie_title]
-        if isinstance(idx, pd.Series):
-            idx = idx.iloc[0]
-        return self.tfidf_matrix[idx]
+        return self.tfidf_matrix[self._resolve_index(movie_title)]
 
     def get_similarity_scores(self, movie_title: str) -> pd.Series:
         """Return cosine similarity scores for all movies vs. the query."""
-        idx = self.movie_indices[movie_title]
-        if isinstance(idx, pd.Series):
-            idx = idx.iloc[0]
+        idx = self._resolve_index(movie_title)
         scores = cosine_similarity(self.tfidf_matrix[idx], self.tfidf_matrix).flatten()
         return pd.Series(scores, index=self.movies_df["movieId"])
